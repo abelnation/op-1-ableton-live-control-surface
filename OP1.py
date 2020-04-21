@@ -1,12 +1,12 @@
 ##################################################################
-# 
+#
 #   Copyright (C) 2012 Imaginando, Lda & Teenage Engineering AB
-#   
+#
 #   This program is free software; you can redistribute it and/or
 #   modify it under the terms of the GNU General Public License
 #   as published by the Free Software Foundation; either version 2
 #   of the License, or any later version.
-#  
+#
 #   This program is distributed in the hope that it will be useful,
 #   but WITHOUT ANY WARRANTY; without even the implied warranty of
 #   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
@@ -17,266 +17,295 @@
 #
 ##################################################################
 
-#OP-1 Python Scripts V1.0.9
+# OP-1 Python Scripts V0.0.1 (Abel custom)
+# Customization by: Abel Allison
 
-import Live
+from functools import partial
 import time
 
-from consts import *
+import Live
+
 
 # Ableton Live Framework imports
-
-from _Framework.ControlSurface import ControlSurface
-from _Framework.TransportComponent import TransportComponent
-from _Framework.MixerComponent import MixerComponent
 from _Framework.ButtonElement import ButtonElement
+from _Framework.ControlSurface import ControlSurface
 from _Framework.EncoderElement import EncoderElement
-from _Framework.DeviceComponent import DeviceComponent
+from _Framework.MixerComponent import MixerComponent
 from _Framework.SessionComponent import SessionComponent
+from _Framework.TransportComponent import TransportComponent
+
+# Provides many constants
 from _Framework.InputControlElement import *
 
-# OP-1 imports
+# Utils from APC libs
+from _APC import ControlElementUtils as APCUtils
+from _APC.DetailViewCntrlComponent import DetailViewCntrlComponent
 
-from OP1ModeSelectorComponent import OP1ModeSelectorComponent
+from .consts import *
+from .ui import *
+from .util import color_to_bytes
+from .util import midi_bytes_to_values
+
+COLOR_BLACK_BYTES = [0x00, 0x00, 0x00]
+COLOR_WHITE_BYTES = [0x7F, 0x7F, 0x7F]
+
+CONNECTION_MAX_RETRIES = 5
+
+#
+# OP-1 Internal Implementation Constants
+#
+
+ENABLE_SEQUENCE = (0xf0, 0x00, 0x20, 0x76, 0x00, 0x01, 0x02, 0xf7)
+DISABLE_SEQUENCE = (0xf0, 0x00, 0x20, 0x76, 0x00, 0x01, 0x00, 0xf7)
+ID_SEQUENCE = (0xf0, 0x7e, 0x7f, 0x06, 0x01, 0xf7)
+
 
 class OP1(ControlSurface):
-	def __init__(self, c_instance):
-		ControlSurface.__init__(self, c_instance)
-		self.c_instance = c_instance
+	def __init__(self, *args, **kwargs):
+		ControlSurface.__init__(self, *args, **kwargs)
 
-		self.retries_count = 0
+		self.log_message('__init__()')
+
+		with self.component_guard():
+			self._build_components()
+
+		# Data for tracking connection attempts
 		self.device_connected = False
+		self.retries_count = 0
+		self._current_midi_map = None
 
-		self.clip_color_callbacks = {}
-		self.slot_callbacks = {}
+		self.show_message("Version: " + VERSION)
 
-		self.text_start_sequence = (0xf0, 0x0, 0x20, 0x76, 0x00, 0x03)
-		self.text_end_sequence = (0xf7,)
-		self.enable_sequence = (0xf0, 0x00, 0x20, 0x76, 0x00, 0x01, 0x02, 0xf7)
-		self.disable_sequence = (0xf0, 0x00, 0x20, 0x76, 0x00, 0x01, 0x00, 0xf7)
+		self.view = CurrentTrackInfoView(surface=self)
 
-		self.id_sequence = (0xf0, 0x7e, 0x7f, 0x06, 0x01, 0xf7)
+		# State of display text
+		self.text_top = ''
+		self.text_bottom = ''
 
-		self.text_color_start_sequence = (0xf0, 0x0, 0x20, 0x76, 0x00, 0x04)
+		# State of display key slots
+		self.display_color_by_slot_num = {}
+		for i in range(NUM_DISPLAY_CLIP_SLOTS):
+		 	self.display_color_by_slot_num[i] = COLOR_BLACK_BYTES
 
-		self.log('INITIALIZING')
+	#
+	# Ableton Helpers
+	#
 
-		self.app = Live.Application.get_application()
+	@property
+	def num_tracks(self):
+		return min(NUM_TRACKS, len(self.song().tracks))
 
-		#maj = self.app.get_major_version()
-		#min = self.app.get_minor_version()
-		#bug = self.app.get_bugfix_version()
-		#self.show_message(str(1) + "." + str(0) + "." + str(9))
+	@property
+	def num_scenes(self):
+		return min(NUM_SCENES, len(self.song().scenes))
 
-		self.show_message("Version " + VERSION)
+	@property
+	def selected_track(self):
+		return self.song().view.selected_track
 
-		# reseting text
-		self.write_text(' ')
+	@property
+	def selected_track_num(self):
+		return list(self.song().tracks).index(self.selected_track)
 
-		# reset display clips
-		self.reset_display_clips()
+	@property
+	def selected_scene(self):
+		return self.song().view.selected_scene
 
-		# getting browser visible state
-		self.session_browser_visible = self.app.view.is_view_visible("Browser")
-		
-		# getting browser visible state
-		self.arrange_browser_visible = self.app.view.is_view_visible("Browser")
+	@property
+	def selected_scene_num(self):
+		return list(self.song().scenes).index(self.selected_scene)
 
-		# getting session view visible state
-		self.session_visible = self.app.view.is_view_visible("Session")
+	@property
+	def selected_clip_slot(self):
+		return self.selected_track.clip_slots[self.selected_scene_num]
 
-		# getting arrange view visible state
-		self.arrange_visible = self.app.view.is_view_visible("Arranger")
+	def get_selected_track_devices(self, class_name):
+		return [
+			device for device in self.selected_track.devices
+			if device.class_name == class_name
+		]
+	#
+	# Connected Components
+	#
 
-		# getting detail view visible state
-		self.detail_visible = self.app.view.is_view_visible("Detail")
+	def _build_components(self):
 
-		# getting back to arranger state
-		self.back_to_arranger_state = self.song().back_to_arranger
+		self._buttons = {}
+		for identifier in range(53) + range(64, 68):
+			# Encoders present as buttons when values are changed
+			button = APCUtils.make_pedal_button(identifier)
+			button.add_value_listener(self.debug_button_handler)
+			self._buttons[identifier] = button
 
-		# initializing channel strip to null
-		self._channel_strip = None
+		# Encoder buttons
+		# See notes below for explanation of exclusion of first button
+		# for identifier in [OP1_ENCODER_2_BUTTON, OP1_ENCODER_3_BUTTON, OP1_ENCODER_4_BUTTON]:
+		# 	button = APCUtils.make_pedal_button(identifier)
+		# 	button.add_value_listener(self.debug_button_handler)
+		# 	APCUtils.make_pedal_button(identifier] = butto)
 
-		# initializing transport component
+		self._notes = {}
+		for identifier in range(OP1_MIN_NOTE, OP1_MAX_NOTE+1):
+			note = APCUtils.make_button(CHANNEL, identifier)
+			note.add_value_listener(self.debug_note_handler)
+			self._notes[identifier] = note
+
+		# Buttons
+		self._button_shift = self._buttons[OP1_SHIFT_BUTTON]
+		self._button_shift.add_value_listener(self.on_shift_button)
+
+		self._button_mode_synth = self._buttons[OP1_MODE_1_BUTTON]
+		self._button_mode_drum = self._buttons[OP1_MODE_2_BUTTON]
+		self._button_mode_tape = self._buttons[OP1_MODE_3_BUTTON]
+		self._button_mode_mixer = self._buttons[OP1_MODE_4_BUTTON]
+
+		self._button_down = self._buttons[OP1_ARROW_DOWN_BUTTON]
+		self._button_up = self._buttons[OP1_ARROW_UP_BUTTON]
+		self._button_left = self._buttons[OP1_LEFT_ARROW]
+		self._button_right = self._buttons[OP1_RIGHT_ARROW]
+
+		self._button_metronome = self._buttons[OP1_METRONOME_BUTTON]
+		self._button_scissors = self._buttons[OP1_SCISSOR_BUTTON]
+
+		self._button_ss1 = self._buttons[OP1_SS1_BUTTON]
+		self._button_ss2 = self._buttons[OP1_SS2_BUTTON]
+		self._button_ss3 = self._buttons[OP1_SS3_BUTTON]
+		self._button_ss4 = self._buttons[OP1_SS4_BUTTON]
+		self._button_ss5 = self._buttons[OP1_SS5_BUTTON]
+		self._button_ss6 = self._buttons[OP1_SS6_BUTTON]
+		self._button_ss7 = self._buttons[OP1_SS7_BUTTON]
+		self._button_ss8 = self._buttons[OP1_SS8_BUTTON]
+
+		self._button_record = self._buttons[OP1_REC_BUTTON]
+		self._button_play = self._buttons[OP1_PLAY_BUTTON]
+		self._button_stop  = self._buttons[OP1_STOP_BUTTON]
+
+		self._button_microphone = self._buttons[OP1_MICROPHONE]
+		self._button_com = self._buttons[OP1_COM]
+		self._button_sequencer = self._buttons[OP1_SEQUENCER]
+
+		# BUG: Can't currently register value change handlers for encoders without
+		#      triggering some sort of registry conflict.
+		# Encoders
+		self._encoder_1 = EncoderElement(MIDI_CC_TYPE, CHANNEL, OP1_ENCODER_1, Live.MidiMap.MapMode.relative_two_compliment)
+		self._encoder_2 = EncoderElement(MIDI_CC_TYPE, CHANNEL, OP1_ENCODER_2, Live.MidiMap.MapMode.relative_two_compliment)
+		self._encoder_3 = EncoderElement(MIDI_CC_TYPE, CHANNEL, OP1_ENCODER_3, Live.MidiMap.MapMode.relative_two_compliment)
+		self._encoder_4 = EncoderElement(MIDI_CC_TYPE, CHANNEL, OP1_ENCODER_4, Live.MidiMap.MapMode.relative_two_compliment)
+
+		# NOTE: encoder_1_button conflicts with encoder_U03_4
+		self._encoder_button_1 = self._buttons[OP1_ENCODER_1_BUTTON]
+		self._encoder_button_2 = self._buttons[OP1_ENCODER_2_BUTTON]
+		self._encoder_button_3 = self._buttons[OP1_ENCODER_3_BUTTON]
+		self._encoder_button_4 = self._buttons[OP1_ENCODER_4_BUTTON]
+
+		self._mixer = MixerComponent(
+			num_tracks=NUM_TRACKS,
+			num_returns=2,
+		)
+		self._mixer.set_select_buttons(
+			prev_button=self._button_up,
+			next_button=self._button_down,
+		)
+		self.map_mixer_controls_for_current_track()
+
+		def on_down_button(value):
+			if value == BUTTON_ON:
+				self.set_selected_scene(self.scene_offset + 1)
+
+		def on_up_button(value):
+			if value == BUTTON_ON:
+				self.set_selected_scene(self.scene_offset - 1)
+
+		self.scene_offset = 0
+		self.song().view.add_selected_scene_listener(self.selected_scene_changed)
+		self._button_right.add_value_listener(on_down_button)
+		self._button_left.add_value_listener(on_up_button)
+
+		# self._session = SessionComponent(
+		# 	num_tracks=NUM_TRACKS,
+		# 	num_scenes=NUM_SCENES,
+		# )
+		# self._session.set_scene_bank_buttons(
+		# 	down_button=self._button_down,
+		# 	up_button=self._button_up,
+		# )
+
 		self._transport = TransportComponent()
+		self._transport.set_metronome_button(self._button_metronome)
 
-		# initializing mixer component
-		self._mixer = MixerComponent(NUM_TRACKS,2)
-
-		# initializing session component
-		self._session = SessionComponent(NUM_TRACKS,NUM_ROWS)
-		self._session.add_offset_listener(self.session_offset_changed)
-
-		# configuring operation mode selector buttons
-		self._operation_mode_buttons = ButtonElement(True, MIDI_CC_TYPE, CHANNEL, OP1_MODE_1_BUTTON), ButtonElement(True, MIDI_CC_TYPE, CHANNEL, OP1_MODE_2_BUTTON), ButtonElement(True, MIDI_CC_TYPE, CHANNEL, OP1_MODE_3_BUTTON), ButtonElement(True, MIDI_CC_TYPE, CHANNEL, OP1_MODE_4_BUTTON), 
-		
-		# initializing operation mode selector
-		self._operation_mode_selector = OP1ModeSelectorComponent(self, self._transport, self._mixer, self._session)
-		
-		# setting operation mode selector buttons
-		self._operation_mode_selector.set_mode_buttons(self._operation_mode_buttons)
-
-		# adding value listener for operation mode index
-		self._operation_mode_selector.add_mode_index_listener(self.mode_index_changed)
-
-		# setting global transport assignments
-		self._transport.set_record_button(ButtonElement(True, MIDI_CC_TYPE, CHANNEL, OP1_REC_BUTTON))
-		self._transport.set_play_button(ButtonElement(True, MIDI_CC_TYPE, CHANNEL, OP1_PLAY_BUTTON))
-		self._transport.set_stop_button(ButtonElement(True, MIDI_CC_TYPE, CHANNEL, OP1_STOP_BUTTON))  
-		self._transport.set_metronome_button(ButtonElement(True, MIDI_CC_TYPE, CHANNEL, OP1_METRONOME_BUTTON))  
-		self._transport.set_tap_tempo_button(ButtonElement(True, MIDI_CC_TYPE, CHANNEL, OP1_HELP_BUTTON))
-		self._transport.set_punch_buttons(ButtonElement(True, MIDI_CC_TYPE, CHANNEL, OP1_SS1_BUTTON), ButtonElement(True,MIDI_CC_TYPE, CHANNEL, OP1_SS2_BUTTON))
-		self._transport.set_loop_button(ButtonElement(True, MIDI_CC_TYPE, CHANNEL, OP1_SS3_BUTTON))
-		self._transport.set_overdub_button(ButtonElement(True, MIDI_CC_TYPE, CHANNEL, OP1_SS4_BUTTON))
-
-		# setting global session assignments
-		self._session.set_scene_bank_buttons(ButtonElement(True, MIDI_CC_TYPE, CHANNEL, OP1_COM),ButtonElement(True, MIDI_CC_TYPE, CHANNEL, OP1_MICRO))
-
-		# setting misc listeners
-		self.browser_toggle_button = ButtonElement(False, MIDI_CC_TYPE, CHANNEL, 15)
-		self.browser_toggle_button.add_value_listener(self.browser_toggle_button_callback)
-
-		self.mainview_toggle_button = ButtonElement(False, MIDI_CC_TYPE, CHANNEL, 16)
-		self.mainview_toggle_button.add_value_listener(self.mainview_toggle_button_callback)
-
-		self.detailview_toggle_button = ButtonElement(False, MIDI_CC_TYPE, CHANNEL, 17)
-		self.detailview_toggle_button.add_value_listener(self.detailview_toggle_button_callback)
-
-		self.clear_track_button = ButtonElement(True, MIDI_CC_TYPE, CHANNEL, 25)
-		self.clear_track_button.add_value_listener(self.clear_track_button_callback)
-
-		self.back_to_arranger_button = ButtonElement(True, MIDI_CC_TYPE, CHANNEL, 26)
-		self.back_to_arranger_button.add_value_listener(self.back_to_arranger_button_callback)
-
-		# adding value listener for selected track change
 		self.song().view.add_selected_track_listener(self.selected_track_changed)
 
-		# adding value listener for selected scene change
-		self.song().view.add_selected_scene_listener(self.selected_scene_changed)
+		#
+		# Controls for navigating the bottom detail pane
+		#
+		self._device_navigation = DetailViewCntrlComponent()
 
-		# setting assignments for currently selected track
-		self.selected_track_changed()
+		# Toggle hide/show of bottom detail pane
+		self._device_navigation.set_detail_toggle_button(self._button_ss5)
 
-		# setting assignments for currently selected scene
-		self.selected_scene_changed()
+		# Toggle between clip detail and effects detail in bottom detail pane
+		self._device_navigation.set_device_clip_toggle_button(self._button_ss6)
 
-	def handle_sysex(self, midi_bytes):
-		if ((midi_bytes[6]==32) and (midi_bytes[7]==118)):
-			self.device_connected = True
-			self.log("OP-1 CONNECTED. SENDING ABLETON LIVE MODE INIT SEQUENCE")
-			self._send_midi(self.enable_sequence)
+		# Nav left/right in the device chain detail view in bottom pane
+		self._device_navigation.device_nav_left_button.set_control_element(self._button_ss7)
+		self._device_navigation.device_nav_right_button.set_control_element(self._button_ss8)
 
-	def add_clip_slot_listeners(self):
-		#self.log('ADDING CLIP SLOT LISTENERS')
-		
-		# creating an empty list for all clip slots
-		clip_slots = []
+		# Clip firing
+		self._notes[OP1_F3_NOTE].add_value_listener(partial(self.clip_fired, 0))
+		self._notes[OP1_G3_NOTE].add_value_listener(partial(self.clip_fired, 1))
+		self._notes[OP1_A3_NOTE].add_value_listener(partial(self.clip_fired, 2))
+		self._notes[OP1_B3_NOTE].add_value_listener(partial(self.clip_fired, 3))
+		self._notes[OP1_C4_NOTE].add_value_listener(partial(self.clip_fired, 4))
+		self._notes[OP1_D4_NOTE].add_value_listener(partial(self.clip_fired, 5))
+		self._notes[OP1_E4_NOTE].add_value_listener(partial(self.clip_fired, 6))
+		self._notes[OP1_F4_NOTE].add_value_listener(partial(self.clip_fired, 7))
 
-		# getting a reference to all tracks
-		tracks = self.song().tracks
-		
-		# appending all tracks clip slots to clip_slots
-		for track in tracks:
-			clip_slots.append(track.clip_slots)
+		self._button_scissors.add_value_listener(self.selected_clip_deleted)
 
-		# iterating over all clip slots
-		for t in range(len(clip_slots)):
-			for c in range(len(clip_slots[t])):
-				clip_slot = clip_slots[t][c]
+	#
+	# Shift Button Alternative modes
+	#
 
-				# adding has clip listener to clip slot
-				self.add_slot_listener(clip_slot)
-
-				# if clip slot has clip
-				if clip_slot.has_clip:
-					# adding clip listeners
-					self.add_clip_listener(clip_slot.clip)
-
-	def rem_clip_slot_listeners(self):
-		#self.log('REMOVING CLIP SLOT LISTENERS')
-
-		# iterate over all clip color change callbacks
-		for c in self.clip_color_callbacks:
-			# if clip still exists
-			if c != None:
-				# and it has a has clip listener
-				if c.color_has_listener(self.clip_color_callbacks[c]) == 1:
-					# remove it
-					c.remove_color_listener(self.clip_color_callbacks[c])
-
-		# iterate over all clip slot callbacks
-		for cs in self.slot_callbacks:
-			# if clip slot still exists
-			if cs != None:
-				# and it has a has clip listener
-				if cs.has_clip_has_listener(self.slot_callbacks[cs]) == 1:
-					# remove it
-					cs.remove_has_clip_listener(self.slot_callbacks[cs])
-
-	def add_slot_listener(self, cs):
-		# setting has clip listener
-		callback = lambda :self.has_clip_listener(cs)
-
-		# if we don't have a clip slot has clip listener for this clip slot yet
-		if not(self.slot_callbacks.has_key(cs)):
-			# adding has clip callback to clip slot
-			cs.add_has_clip_listener(callback)
-
-			# saving callback for future release
-			self.slot_callbacks[cs] = callback
-
-	def add_clip_listener(self, clip):
-		# setting callback for clip color change
-		color_callback = lambda :self.update_display_clips()
-
-		# if we don't have a clip color change callback for this clip yet
-		if not(self.clip_color_callbacks.has_key(clip)):
-			# adding clip color change callback
-			clip.add_color_listener(color_callback)
-
-			# saving callback for future release
-			self.clip_color_callbacks[clip] = color_callback
-
-	def has_clip_listener(self, cs):
-		# clip slot has clip listener callback
-		if cs.has_clip:
-			# add clip listener
-			self.add_clip_listener(cs.clip)
+	def on_shift_button(self, value):
+		if value == BUTTON_ON:
+			self.log_message('shift on')
+			pass
 		else:
-			# update display if clip slot was removed
-			self.update_display_clips()
+			self.log_message('shift off')
+			pass
 
-	def session_offset_changed(self):
-		# if session component offset changes, update display
-		self.update_display_clips()
+	#
+	# Scene selection
+	#
 
 	def selected_scene_changed(self):
-		# if on clip mode update display
-		if (self._operation_mode_selector.mode_index==OP1_MODE_CLIP):
-			self.update_display_clip_mode()
+		self.log_message('selected_scene_changed()')
+		self.scene_offset = self.selected_scene_num
+		self.map_clip_controls_for_current_scene()
 
-	def mode_index_changed(self):
-		# update display to current mode info
-		if (self._operation_mode_selector.mode_index==OP1_MODE_PERFORM):
-			self.update_display_perform_mode()
-		elif (self._operation_mode_selector.mode_index==OP1_MODE_CLIP):
-			self.update_display_clip_mode()
-		elif (self._operation_mode_selector.mode_index==OP1_MODE_TRANSPORT):
-			self.update_display_transport_mode()
-		elif (self._operation_mode_selector.mode_index==OP1_MODE_MIXER):
-			self.update_display_mixer_mode()
+	def set_selected_scene(self, scene_offset):
+		scene_offset = max(0, scene_offset)
+		scene_offset = min(scene_offset, self.num_scenes-1)
 
-	def	clear_track_button_callback(self, value):
-		# if clear track button was called, reset track
-		if (value==127):
-			for i in range(len(self.song().tracks)):
-				self.song().tracks[i].arm = 0
-				self.song().tracks[i].solo = 0
-				self.song().tracks[i].mute = 0
+		next_scene = self.song().scenes[scene_offset]
+		next_scene = self.song().view.selected_scene = next_scene
 
-			for i in range(len(self.song().return_tracks)):
-				self.song().tracks[i].solo = 0
-				self.song().tracks[i].mute = 0
+		self.scene_offset = scene_offset
+
+	def clear_key_assignments(self):
+		pass
+
+	def map_clip_controls_for_current_scene(self):
+		for clip_slot in self.selected_scene.clip_slots:
+			pass
+
+	#
+	# Mixer Control Mapping
+	#
+
+	def selected_track_changed(self):
+		self.log_message('selected_track_changed()')
+		self.map_mixer_controls_for_current_track()
 
 	def clear_return_track_assignment(self, strip):
 		# clear return track assingments
@@ -284,7 +313,7 @@ class OP1(ControlSurface):
 		strip.set_pan_control(None)
 		strip.set_mute_button(None)
 		strip.set_solo_button(None)
-	
+
 	def clear_track_assignment(self, strip):
 		# clear track assignments
 		strip.set_volume_control(None)
@@ -293,7 +322,9 @@ class OP1(ControlSurface):
 		strip.set_solo_button(None)
 		strip.set_arm_button(None)
 
-	def clear_tracks_assigments(self):
+	def map_mixer_controls_for_current_track(self):
+		self.log_message('map_mixer_controls_for_current_track()')
+
 		# for all normal tracks, clear assignments
 		for i in range(NUM_TRACKS):
 			strip = self._mixer.channel_strip(i)
@@ -301,100 +332,127 @@ class OP1(ControlSurface):
 				self.clear_track_assignment(strip)
 
 		# for all return tracks, clear assignments
-		for i in range(2):
+		for i in range(NUM_RETURN_TRACKS):
 			return_strip = self._mixer.return_strip(i)
 			if (return_strip!=None):
 				self.clear_return_track_assignment(return_strip)
 
-	def selected_track_changed(self):
-		# if on mixer mode update display
-		if (self._operation_mode_selector.mode_index==OP1_MODE_MIXER):
-			self.update_display_mixer_mode()
-
-		# clear track assignments
-		self.clear_tracks_assigments()
-
 		# getting selected strip
-		self._channel_strip = self._mixer.selected_strip()
+		channel_strip = self._mixer.selected_strip()
 
-		# perform track assignments 
-		self._channel_strip.set_volume_control(EncoderElement(MIDI_CC_TYPE, CHANNEL, OP1_ENCODER_1, Live.MidiMap.MapMode.relative_two_compliment))
-		self._channel_strip.set_pan_control(EncoderElement(MIDI_CC_TYPE, CHANNEL, OP1_ENCODER_2, Live.MidiMap.MapMode.relative_two_compliment))
-
-		# setting a tuple of encoders to control sends
-		send_controls = EncoderElement(MIDI_CC_TYPE, CHANNEL, OP1_ENCODER_3, Live.MidiMap.MapMode.relative_two_compliment), EncoderElement(MIDI_CC_TYPE, CHANNEL, OP1_ENCODER_4, Live.MidiMap.MapMode.relative_two_compliment),
+		# perform track assignments
+		channel_strip.set_volume_control(self._encoder_1)
+		channel_strip.set_pan_control(self._encoder_2)
 
 		# setting send encoders
-		self._channel_strip.set_send_controls(tuple(send_controls))
-
-		# setting solo button
-		self._channel_strip.set_solo_button(ButtonElement(True, MIDI_CC_TYPE, CHANNEL, OP1_SS6_BUTTON))
-
-		# if track can be armed, set arm button
-		if (self._channel_strip._track.can_be_armed):
-			self._channel_strip.set_arm_button(ButtonElement(True, MIDI_CC_TYPE, CHANNEL, OP1_SS7_BUTTON))
+		channel_strip.set_send_controls((
+			self._encoder_3,
+			self._encoder_4,
+		))
 
 		# if track is no master, set mute button
-		if (self._channel_strip._track!=self.song().master_track):
-			self._channel_strip.set_mute_button(ButtonElement(True, MIDI_CC_TYPE, CHANNEL, OP1_SS5_BUTTON))
+		if (channel_strip._track!=self.song().master_track):
+			channel_strip.set_mute_button(self._button_stop)
 
+		# setting solo button
+		channel_strip.set_solo_button(self._button_play)
 
-	def browser_toggle_button_callback(self, value):
-		if (value==127):
-			if (self.session_visible):
-				if (self.session_browser_visible==True):
-					self.session_browser_visible=False
-					self.app.view.hide_view("Browser")
-				else:
-					self.session_browser_visible=True
-					self.app.view.show_view("Browser")
+		# if track can be armed, set arm button
+		if (channel_strip._track.can_be_armed):
+			channel_strip.set_arm_button(self._button_record)
 
-			if (self.arrange_visible):
-				if (self.arrange_browser_visible==True):
-					self.arrange_browser_visible=False
-					self.app.view.hide_view("Browser")
-				else:
-					self.arrange_browser_visible=True
-					self.app.view.show_view("Browser")
+	#
+	# Clip triggers
+	#
 
-	def back_to_arranger_button_callback(self, value):
-		if (value==127):
-			self.song().back_to_arranger = False
+	def clip_fired(self, clip_num, value):
+		self.log_message('clip_fired(clip_num=%s, value=%s)' % (clip_num, value))
+		if value == NOTE_ON:
+			clip_slot = self.selected_track.clip_slots[clip_num]
 
-	def mainview_toggle_button_callback(self, value):
-		if (value==127):
-			if (self.session_visible==True):
-				self.session_visible=False
-				self.arrange_visible=True
-				self.app.view.show_view("Arranger")
-				self.arrange_browser_visible = self.app.view.is_view_visible("Browser");
+			if clip_slot.is_playing:
+				self.log_message('stoping clip')
+				clip_slot.stop()
 			else:
-				self.session_visible=True
-				self.arrange_visible=False
-				self.app.view.show_view("Session")
-				self.session_browser_visible = self.app.view.is_view_visible("Browser");
+				self.log_message('firing clip. has_clip=%s has_stop=%s, playing_status=%s' % (
+					clip_slot.has_clip,
+					clip_slot.has_stop_button,
+					clip_slot.playing_status,
+				))
+				clip_slot.fire()
 
-	def detailview_toggle_button_callback(self, value):
-		if (value==127):
-			if (self.detail_visible==True):
-				self.detail_visible=False
-				self.app.view.hide_view("Detail")
-			else:
-				self.detail_visible=True
-				self.app.view.show_view("Detail")
+			# Update scene selection to fired clip's row.
+			self.set_selected_scene(clip_num)
 
-	def write_text(self, msg):
-		text_list = []
-		sequence = ()
-		
-		text_list.append(len(msg.strip()))
-		
-		for i in msg.strip():
-   			text_list.append(ord(i))
-   		
-   		sequence = self.text_start_sequence + tuple(text_list) + self.text_end_sequence
-		
-		self._send_midi(sequence)
+	def selected_clip_deleted(self, value):
+		if value == BUTTON_ON:
+			self.log_message('deleting clip')
+			self.selected_clip_slot.delete_clip()
+
+	#
+	# Looper triggers
+	#
+
+	def looper_fired(looper_device):
+		fire_param = [param for param in looper_device.parameters if param.name == 'State']
+		self.log_message(fire_param)
+
+	#
+	# Refresh handling
+	#
+
+	def handle_sysex(self, midi_bytes):
+		super(OP1, self).handle_sysex(midi_bytes)
+		if (len(midi_bytes) >= 8 and (midi_bytes[6]==32) and (midi_bytes[7]==118)):
+			self.handle_device_connection_success()
+		else:
+			self.log_message("sysex: %s" % (midi_bytes, ))
+
+	def refresh_state(self):
+		super(OP1, self).refresh_state()
+
+		self.log_message("refresh_state()")
+		self.retries_count = 0
+		self.device_connected = False
+
+	def update_display(self):
+		super(OP1, self).update_display()
+
+		if not(self.device_connected) and self.retries_count < CONNECTION_MAX_RETRIES:
+			self.attempt_connection_with_device()
+			return
+
+		# Render the currently active view
+		self.view.render()
+
+	#
+	# Connection Management
+	#
+
+	def build_midi_map(self, midi_map_handle):
+		super(OP1, self).build_midi_map(midi_map_handle)
+
+		# map mixer controls to currently selected track
+		self.map_mixer_controls_for_current_track()
+
+	def attempt_connection_with_device(self):
+		self.log_message("Attempting to connect to OP-1... (num_retries: %s)" % self.retries_count)
+		self.retries_count += 1
+		self._send_midi(ID_SEQUENCE)
+		time.sleep(1)
+
+	def handle_device_connection_success(self):
+		self.device_connected = True
+		self.retries_count = 0
+		self.log_message("OP-1 Connected")
+		self._send_midi(ENABLE_SEQUENCE)
+
+	def disconnect(self):
+		self.log_message("disconnect()")
+		self.retries_count = 0
+		self.device_connected = False
+		self._send_midi(DISABLE_SEQUENCE)
+		super(OP1, self).disconnect()
 
 	def suggest_input_port(self):
 		return "OP-1 Midi Device"
@@ -402,172 +460,23 @@ class OP1(ControlSurface):
 	def suggest_output_port(self):
 		return "OP-1 Midi Device"
 
-	def update_display_perform_mode(self):
-		self.write_text("perform\rmode")
+	#
+	# Debug utils
+	#
 
-	def reset_display_clips(self):
-		count = 0
-		colors = []
-		length = []
-		sequence = ()
-		
-		for i in range (NUM_TRACKS):
-			count+=1
+	def param_value_updated(self, param):
+		self.log_message('Param update: %s(%s)' % (param.name, param.value))
+		self.log_message('    value_items: %s' % (list(param.value_items), ))
 
-			colors.append(0x00)
-			colors.append(0x00)
-			colors.append(0x00)
+	def debug_button_handler(self, value, *args, **kwargs):
+		self.log_message('button: %s' % value)
 
-		length.append(count)
-		sequence = self.text_color_start_sequence + tuple(length) + tuple(colors) + self.text_end_sequence
-		self._send_midi(sequence)
+	def debug_note_handler(self, value, *args, **kwargs):
+		self.log_message('note: %s' % value)
 
-	def update_display_clips(self):
-		#self.log("UPDATING DISPLAY CLIPS")
-		count = 0
-		colors = []
-		length = []
-		sequence = ()
-		
-		tracks_len = len(self.song().tracks)-self._session._track_offset
-
-		if (tracks_len>NUM_TRACKS):
-			tracks_len = NUM_TRACKS
-
-		for i in range (tracks_len):
-			count+=1
-
-			clip_slot = self._session.scene(0).clip_slot(i)
-			
-			if (clip_slot!=None):
-				if (clip_slot.has_clip()!=False):
-					clip_color = clip_slot._clip_slot.clip.color
-					colors.append(((clip_color>>16)&0x000000ff)>>1)
-					colors.append(((clip_color>>8)&0x000000ff)>>1)
-					colors.append((clip_color&0x000000ff)>>1)
-				else:
-					colors.append(0x00)
-					colors.append(0x00)
-					colors.append(0x00)
-			else:
-				colors.append(0x00)
-				colors.append(0x00)
-				colors.append(0x00)
-
-		length.append(count)
-		sequence = self.text_color_start_sequence + tuple(length) + tuple(colors) + self.text_end_sequence
-		self._send_midi(sequence)
-
-	def update_display_clip_mode(self):
-		self.write_text("sel. scene\r" + str(self.song().view.selected_scene.name.lower().strip()))
-
-	def update_display_transport_mode(self):
-		song_time = str(self.song().get_current_beats_song_time())
-		self.write_text("song pos.\r" + song_time[:len(song_time)-4])
-
-	def update_display_mixer_mode(self):
-		self.write_text("sel. track\r" + str(self.song().view.selected_track.name.lower()))
-
-	def update_display(self):
-		if not(self.device_connected):
-			if (self.retries_count<5):
-				self.log("TRYING OP-1 CONNECTION")
-				self.retries_count+=1
-				self._send_midi(self.id_sequence)
-				time.sleep(1)
-
-		# if in transport mode, update display with song position
-		if (self._operation_mode_selector.mode_index==OP1_MODE_TRANSPORT):
-			self.update_display_transport_mode()
-
-		# checking if app current view is session
-		if (self.app.view.is_view_visible("Session")):
-			# checking if session browser state is diferent from the internal
-			if (self.session_browser_visible != self.app.view.is_view_visible("Browser")):
-				self.session_browser_visible = self.app.view.is_view_visible("Browser")
-
-		# checking if app current view is arrange
-		if (self.app.view.is_view_visible("Arranger")):
-			# checking if arrange browser state is diferent from the internal
-			if (self.arrange_browser_visible != self.app.view.is_view_visible("Browser")):
-				self.arrange_browser_visible = self.app.view.is_view_visible("Browser")
-
-		# checking if app current view is detail
-		if (self.app.view.is_view_visible("Detail")):
-			# checking if detail state is diferent from the internal
-			if (self.detail_visible != self.app.view.is_view_visible("Detail")):
-				self.detail_visible = self.app.view.is_view_visible("Detail")
-
-	def refresh_state(self):
-		self.log("REFRESH STATE")
-		self.retries_count = 0
-		self.device_connected = False
-
-	def build_midi_map(self, midi_map_handle):
-		#self.log("BUILD MIDI MAP")
-
-		assert (self._suppress_requests_counter == 0)
-		self._in_build_midi_map = True
-		self._midi_map_handle = midi_map_handle
-		self._forwarding_registry = {}
-		for control in self.controls:
-			if isinstance(control, InputControlElement):
-				control.install_connections()
-		self._midi_map_handle = None
-		self._in_build_midi_map = False
-		if (self._pad_translations != None):
-			self._c_instance.set_pad_translation(self._pad_translations)
-
-		# remove clip listeners
-		self.rem_clip_slot_listeners()
-		
-		# add clip listeners
-		self.add_clip_slot_listeners()
-		
-		# update display
-		self.update_display_clips()
-		
-	def log(self, msg):
-		self.c_instance.log_message("[TE OP-1] " + msg)
-
-	def disconnect(self):
-		# removing clip slots listeners
-		self.rem_clip_slot_listeners()
-
-		# removing value listener for track changed
-		self.song().view.remove_selected_track_listener(self.selected_track_changed)
-
-		# removing value listener for scene changed
-		self.song().view.remove_selected_scene_listener(self.selected_scene_changed)
-
-		# removing value listener for operation mode index
-		self._operation_mode_selector.remove_mode_index_listener(self.mode_index_changed)
-
-		# removing global transport assignments
-		self._transport.set_punch_buttons(None, None)
-		self._transport.set_loop_button(None)
-		self._transport.set_overdub_button(None)
-		self._transport.set_record_button(None)
-		self._transport.set_play_button(None)
-		self._transport.set_stop_button(None)  
-		self._transport.set_metronome_button(None)  
-		self._transport.set_tap_tempo_button(None)
-
-		# removing global session assignments
-		self._session.set_scene_bank_buttons(None, None)
-		
-		# removing misc listeners
-		self.browser_toggle_button.remove_value_listener(self.browser_toggle_button_callback)
-		self.mainview_toggle_button.remove_value_listener(self.mainview_toggle_button_callback)
-		self.detailview_toggle_button.remove_value_listener(self.detailview_toggle_button_callback)
-		self.clear_track_button.remove_value_listener(self.clear_track_button_callback)
-		self.back_to_arranger_button.remove_value_listener(self.back_to_arranger_button_callback)
-		
-		# sending special ableton mode disable sequence
-		self._send_midi(self.disable_sequence)
-		
-		# disconnecting control surface
-		ControlSurface.disconnect(self)
-		
-		self.log("DISCONNECTED")
+	def handle_nonsysex(self, midi_bytes):
+		super(OP1, self).handle_nonsysex(midi_bytes)
+		channel, identifier, value, is_pitchbend = midi_bytes_to_values(midi_bytes)
+		if not is_pitchbend:
+			self.log_message('midi ch:%s value:%s(%s)' % (channel, identifier, value))
 
