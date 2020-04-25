@@ -32,6 +32,9 @@ class OP1View(object):
     def surface(self):
         return self._surface
 
+    def song(self):
+        return self.surface.song()
+
     def render(self):
         self.update()
 
@@ -136,7 +139,10 @@ class CurrentTrackInfoView(OP1View):
         if selected_track.arm:
             track_attrs.append('Armed')
 
-        self.set_bottom_text(','.join(track_attrs))
+        bottom_text = 'Track'
+        if track_attrs:
+            bottom_text += ': ' + ','.join(track_attrs)
+        self.set_bottom_text(bottom_text)
 
     def display_selected_track_clips(self):
         selected_track = self.surface.selected_track
@@ -163,3 +169,36 @@ class CurrentTrackInfoView(OP1View):
 
         for i in range(num_clip_slots, NUM_DISPLAY_CLIP_SLOTS):
             self.set_key_slot_color(i, COLOR_BLACK_BYTES)
+
+
+class CurrentTrackEffectsView(OP1View):
+    def __init__(self, surface):
+        super(CurrentTrackEffectsView, self).__init__(surface)
+        self._param = None
+
+    def update(self):
+        self.display_device_info()
+
+    @property
+    def param(self):
+        return self._param
+
+    def set_displayed_device_param(self, param):
+        self.log_message('set_displayed_device_param: %s' % (param.name if param else 'None'))
+        self._param = param
+
+    def format_param_value_for_dispay(self, param):
+        name = self.param.name
+        if len(name) > 9:
+            name = name[:9]
+        value = self.param.str_for_value(self.param.value)
+        if len(value) > 7:
+            value = value[:7]
+        return '%s: %s' % (name, value)
+
+    def display_device_info(self):
+        device = self.surface.selected_device
+        self.set_top_text('%s' % device.name)
+
+        if self.param is not None:
+            self.set_bottom_text(self.format_param_value_for_dispay(self.param))

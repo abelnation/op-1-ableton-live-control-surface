@@ -28,9 +28,14 @@ import Live
 
 # Ableton Live Framework imports
 from _Framework.ButtonElement import ButtonElement
+from _Framework.ButtonMatrixElement import ButtonMatrixElement
+from _Framework.ComboElement import ComboElement
 from _Framework.ControlSurface import ControlSurface
+from _Framework.DeviceComponent import DeviceComponent
 from _Framework.EncoderElement import EncoderElement
+from _Framework.Layer import Layer
 from _Framework.MixerComponent import MixerComponent
+from _Framework.Resource import PrioritizedResource
 from _Framework.SessionComponent import SessionComponent
 from _Framework.TransportComponent import TransportComponent
 
@@ -41,8 +46,10 @@ from _Framework.InputControlElement import *
 from _APC import ControlElementUtils as APCUtils
 from _APC.DetailViewCntrlComponent import DetailViewCntrlComponent
 
+from . import modes
+from . import ui
 from .consts import *
-from .ui import *
+from .ShiftEnabledControl import ShiftEnabledControl
 from .util import color_to_bytes
 from .util import midi_bytes_to_values
 
@@ -50,6 +57,8 @@ COLOR_BLACK_BYTES = [0x00, 0x00, 0x00]
 COLOR_WHITE_BYTES = [0x7F, 0x7F, 0x7F]
 
 CONNECTION_MAX_RETRIES = 5
+
+ENCODER_MODE = Live.MidiMap.MapMode.relative_two_compliment
 
 #
 # OP-1 Internal Implementation Constants
@@ -65,18 +74,14 @@ class OP1(ControlSurface):
 		ControlSurface.__init__(self, *args, **kwargs)
 
 		self.log_message('__init__()')
-
-		with self.component_guard():
-			self._build_components()
+		self.show_message("Version: " + VERSION)
 
 		# Data for tracking connection attempts
 		self.device_connected = False
+		self.next_retry_delay = 1
+		self.next_retry_ts = None
 		self.retries_count = 0
 		self._current_midi_map = None
-
-		self.show_message("Version: " + VERSION)
-
-		self.view = CurrentTrackInfoView(surface=self)
 
 		# State of display text
 		self.text_top = ''
@@ -87,6 +92,9 @@ class OP1(ControlSurface):
 		for i in range(NUM_DISPLAY_CLIP_SLOTS):
 		 	self.display_color_by_slot_num[i] = COLOR_BLACK_BYTES
 
+		with self.component_guard():
+			self._build_components()
+			self.init_modes()
 	#
 	# Ableton Helpers
 	#
@@ -119,19 +127,30 @@ class OP1(ControlSurface):
 	def selected_clip_slot(self):
 		return self.selected_track.clip_slots[self.selected_scene_num]
 
+	@property
+	def selected_device(self):
+		return self.selected_track.view.selected_device
+
 	def get_selected_track_devices(self, class_name):
 		return [
 			device for device in self.selected_track.devices
 			if device.class_name == class_name
 		]
+
 	#
 	# Connected Components
 	#
 
+	def _with_shift(self, control):
+		return ComboElement(control, modifiers=[self._button_shift])
+
 	def _build_components(self):
 
 		self._buttons = {}
-		for identifier in range(53) + range(64, 68):
+		for identifier in range(5, 53) + range(64, 68):
+			# We create the shift button in a special way
+			if identifier == OP1_SHIFT_BUTTON:
+				continue
 			# Encoders present as buttons when values are changed
 			button = APCUtils.make_pedal_button(identifier)
 			button.add_value_listener(self.debug_button_handler)
@@ -151,13 +170,26 @@ class OP1(ControlSurface):
 			self._notes[identifier] = note
 
 		# Buttons
-		self._button_shift = self._buttons[OP1_SHIFT_BUTTON]
-		self._button_shift.add_value_listener(self.on_shift_button)
+		self._button_shift = ButtonElement(
+			is_momentary=True,
+			msg_type=MIDI_CC_TYPE,
+			channel=0,
+			identifier=OP1_SHIFT_BUTTON,
+			# Required for modifier buttons
+			resource_type=PrioritizedResource,
+			name='ShiftButton',
+		)
+		# self._button_shift.add_value_listener(self.on_shift_button)
 
 		self._button_mode_synth = self._buttons[OP1_MODE_1_BUTTON]
 		self._button_mode_drum = self._buttons[OP1_MODE_2_BUTTON]
 		self._button_mode_tape = self._buttons[OP1_MODE_3_BUTTON]
 		self._button_mode_mixer = self._buttons[OP1_MODE_4_BUTTON]
+
+		self._button_mode_1 = self._buttons[OP1_T1_BUTTON]
+		self._button_mode_2 = self._buttons[OP1_T2_BUTTON]
+		self._button_mode_3 = self._buttons[OP1_T3_BUTTON]
+		self._button_mode_4 = self._buttons[OP1_T4_BUTTON]
 
 		self._button_down = self._buttons[OP1_ARROW_DOWN_BUTTON]
 		self._button_up = self._buttons[OP1_ARROW_UP_BUTTON]
@@ -184,13 +216,39 @@ class OP1(ControlSurface):
 		self._button_com = self._buttons[OP1_COM]
 		self._button_sequencer = self._buttons[OP1_SEQUENCER]
 
-		# BUG: Can't currently register value change handlers for encoders without
-		#      triggering some sort of registry conflict.
 		# Encoders
-		self._encoder_1 = EncoderElement(MIDI_CC_TYPE, CHANNEL, OP1_ENCODER_1, Live.MidiMap.MapMode.relative_two_compliment)
-		self._encoder_2 = EncoderElement(MIDI_CC_TYPE, CHANNEL, OP1_ENCODER_2, Live.MidiMap.MapMode.relative_two_compliment)
-		self._encoder_3 = EncoderElement(MIDI_CC_TYPE, CHANNEL, OP1_ENCODER_3, Live.MidiMap.MapMode.relative_two_compliment)
-		self._encoder_4 = EncoderElement(MIDI_CC_TYPE, CHANNEL, OP1_ENCODER_4, Live.MidiMap.MapMode.relative_two_compliment)
+		self._encoder_1 = EncoderElement(MIDI_CC_TYPE, CHANNEL, OP1_ENCODER_1, ENCODER_MODE)
+		self._encoder_2 = EncoderElement(MIDI_CC_TYPE, CHANNEL, OP1_ENCODER_2, ENCODER_MODE)
+		self._encoder_3 = EncoderElement(MIDI_CC_TYPE, CHANNEL, OP1_ENCODER_3, ENCODER_MODE)
+		self._encoder_4 = EncoderElement(MIDI_CC_TYPE, CHANNEL, OP1_ENCODER_4, ENCODER_MODE)
+
+		self._unshift_encoder_1 = ShiftEnabledControl(self._encoder_1, self._button_shift, False, self)
+		self._unshift_encoder_2 = ShiftEnabledControl(self._encoder_2, self._button_shift, False, self)
+		self._unshift_encoder_3 = ShiftEnabledControl(self._encoder_3, self._button_shift, False, self)
+		self._unshift_encoder_4 = ShiftEnabledControl(self._encoder_4, self._button_shift, False, self)
+		self._shift_encoder_1 = ShiftEnabledControl(self._encoder_1, self._button_shift, True, self)
+		self._shift_encoder_2 = ShiftEnabledControl(self._encoder_2, self._button_shift, True, self)
+		self._shift_encoder_3 = ShiftEnabledControl(self._encoder_3, self._button_shift, True, self)
+		self._shift_encoder_4 = ShiftEnabledControl(self._encoder_4, self._button_shift, True, self)
+
+		self._encoder_u01_1 = EncoderElement(MIDI_CC_TYPE, CHANNEL, OP1_U01_ENCODER_1, ENCODER_MODE)
+		self._encoder_u01_2 = EncoderElement(MIDI_CC_TYPE, CHANNEL, OP1_U01_ENCODER_2, ENCODER_MODE)
+		self._encoder_u01_3 = EncoderElement(MIDI_CC_TYPE, CHANNEL, OP1_U01_ENCODER_3, ENCODER_MODE)
+		self._encoder_u01_4 = EncoderElement(MIDI_CC_TYPE, CHANNEL, OP1_U01_ENCODER_4, ENCODER_MODE)
+
+		self._unshift_encoder_u01_1 = ShiftEnabledControl(self._encoder_u01_1, self._button_shift, False, self)
+		self._unshift_encoder_u01_2 = ShiftEnabledControl(self._encoder_u01_2, self._button_shift, False, self)
+		self._unshift_encoder_u01_3 = ShiftEnabledControl(self._encoder_u01_3, self._button_shift, False, self)
+		self._unshift_encoder_u01_4 = ShiftEnabledControl(self._encoder_u01_4, self._button_shift, False, self)
+		self._shift_encoder_u01_1 = ShiftEnabledControl(self._encoder_u01_1, self._button_shift, True, self)
+		self._shift_encoder_u01_2 = ShiftEnabledControl(self._encoder_u01_2, self._button_shift, True, self)
+		self._shift_encoder_u01_3 = ShiftEnabledControl(self._encoder_u01_3, self._button_shift, True, self)
+		self._shift_encoder_u01_4 = ShiftEnabledControl(self._encoder_u01_4, self._button_shift, True, self)
+
+		self._encoder_u02_1 = EncoderElement(MIDI_CC_TYPE, CHANNEL, OP1_U02_ENCODER_1, ENCODER_MODE)
+		self._encoder_u02_2 = EncoderElement(MIDI_CC_TYPE, CHANNEL, OP1_U02_ENCODER_2, ENCODER_MODE)
+		self._encoder_u02_3 = EncoderElement(MIDI_CC_TYPE, CHANNEL, OP1_U02_ENCODER_3, ENCODER_MODE)
+		self._encoder_u02_4 = EncoderElement(MIDI_CC_TYPE, CHANNEL, OP1_U02_ENCODER_4, ENCODER_MODE)
 
 		# NOTE: encoder_1_button conflicts with encoder_U03_4
 		self._encoder_button_1 = self._buttons[OP1_ENCODER_1_BUTTON]
@@ -202,11 +260,11 @@ class OP1(ControlSurface):
 			num_tracks=NUM_TRACKS,
 			num_returns=2,
 		)
-		self._mixer.set_select_buttons(
-			prev_button=self._button_up,
-			next_button=self._button_down,
-		)
-		self.map_mixer_controls_for_current_track()
+		# self._mixer.set_select_buttons(
+		# 	prev_button=self._button_up,
+		# 	next_button=self._button_down,
+		# )
+		# self.map_mixer_controls_for_current_track()
 
 		def on_down_button(value):
 			if value == BUTTON_ON:
@@ -221,19 +279,8 @@ class OP1(ControlSurface):
 		self._button_right.add_value_listener(on_down_button)
 		self._button_left.add_value_listener(on_up_button)
 
-		# self._session = SessionComponent(
-		# 	num_tracks=NUM_TRACKS,
-		# 	num_scenes=NUM_SCENES,
-		# )
-		# self._session.set_scene_bank_buttons(
-		# 	down_button=self._button_down,
-		# 	up_button=self._button_up,
-		# )
-
 		self._transport = TransportComponent()
 		self._transport.set_metronome_button(self._button_metronome)
-
-		self.song().view.add_selected_track_listener(self.selected_track_changed)
 
 		#
 		# Controls for navigating the bottom detail pane
@@ -241,10 +288,10 @@ class OP1(ControlSurface):
 		self._device_navigation = DetailViewCntrlComponent()
 
 		# Toggle hide/show of bottom detail pane
-		self._device_navigation.set_detail_toggle_button(self._button_ss5)
+		self._device_navigation.set_detail_toggle_button(self._button_ss1)
 
 		# Toggle between clip detail and effects detail in bottom detail pane
-		self._device_navigation.set_device_clip_toggle_button(self._button_ss6)
+		self._device_navigation.set_device_clip_toggle_button(self._button_ss2)
 
 		# Nav left/right in the device chain detail view in bottom pane
 		self._device_navigation.device_nav_left_button.set_control_element(self._button_ss7)
@@ -261,6 +308,71 @@ class OP1(ControlSurface):
 		self._notes[OP1_F4_NOTE].add_value_listener(partial(self.clip_fired, 7))
 
 		self._button_scissors.add_value_listener(self.selected_clip_deleted)
+
+		#
+		# Device Controls
+		#
+
+		# self._device = DeviceComponent(
+		# 	name='Device_Component',
+		# 	is_enabled=False,
+		# 	layer=Layer(
+		# 		parameter_controls=ButtonMatrixElement(rows=[[
+  #    				self._encoder_u01_1,
+		# 			self._encoder_u01_2,
+		# 			self._encoder_u01_3,
+		# 			self._encoder_u01_4,
+		# 			self._encoder_u02_1,
+		# 			self._encoder_u02_2,
+		# 			self._encoder_u02_3,
+		# 			self._encoder_u02_4,
+  #        		]]),
+		# 		# bank_buttons=ButtonMatrixElement(rows=[[
+		# 		# 	self._encoder_button_1,
+		# 		# 	self._encoder_button_2,
+		# 		# 	self._encoder_button_3,
+		# 		# 	self._encoder_button_4,
+		# 		# ]]),
+		# 		bank_prev_button=self._button_ss5,
+		# 		bank_next_button=self._button_ss6,
+		# 		on_off_button=self._button_record,
+		# 	),
+		# 	device_selection_follows_track_selection=True
+		# )
+		# self._device.set_enabled(True)
+		# self.set_device_component(self._device)
+
+	#
+	# Mode configuration
+	#
+
+	def init_modes(self):
+		self.tracks_mode = modes.TracksMode(self)
+		self.effects_mode = modes.EffectsMode(self)
+
+		self.current_mode = None
+
+		self._button_mode_synth.add_value_listener(
+			partial(self.on_mode_button, self.tracks_mode))
+		self._button_mode_drum.add_value_listener(
+		 	partial(self.on_mode_button, self.effects_mode))
+		# self._button_mode_3.add_value_listener(
+		# 	partial(self.on_mode_button, ))
+		# self._button_mode_4.add_value_listener(
+		# 	partial(self.on_mode_button, ))
+
+		self.set_mode(self.tracks_mode)
+
+	def set_mode(self, mode):
+		self.log_message('set_mode()')
+		if self.current_mode is not None:
+			self.current_mode.deactivate()
+		self.current_mode = mode
+		self.current_mode.activate()
+
+	def on_mode_button(self, mode, value):
+		if value:
+			self.set_mode(mode)
 
 	#
 	# Shift Button Alternative modes
@@ -300,86 +412,34 @@ class OP1(ControlSurface):
 			pass
 
 	#
-	# Mixer Control Mapping
-	#
-
-	def selected_track_changed(self):
-		self.log_message('selected_track_changed()')
-		self.map_mixer_controls_for_current_track()
-
-	def clear_return_track_assignment(self, strip):
-		# clear return track assingments
-		strip.set_volume_control(None)
-		strip.set_pan_control(None)
-		strip.set_mute_button(None)
-		strip.set_solo_button(None)
-
-	def clear_track_assignment(self, strip):
-		# clear track assignments
-		strip.set_volume_control(None)
-		strip.set_pan_control(None)
-		strip.set_mute_button(None)
-		strip.set_solo_button(None)
-		strip.set_arm_button(None)
-
-	def map_mixer_controls_for_current_track(self):
-		self.log_message('map_mixer_controls_for_current_track()')
-
-		# for all normal tracks, clear assignments
-		for i in range(NUM_TRACKS):
-			strip = self._mixer.channel_strip(i)
-			if (strip!=None):
-				self.clear_track_assignment(strip)
-
-		# for all return tracks, clear assignments
-		for i in range(NUM_RETURN_TRACKS):
-			return_strip = self._mixer.return_strip(i)
-			if (return_strip!=None):
-				self.clear_return_track_assignment(return_strip)
-
-		# getting selected strip
-		channel_strip = self._mixer.selected_strip()
-
-		# perform track assignments
-		channel_strip.set_volume_control(self._encoder_1)
-		channel_strip.set_pan_control(self._encoder_2)
-
-		# setting send encoders
-		channel_strip.set_send_controls((
-			self._encoder_3,
-			self._encoder_4,
-		))
-
-		# if track is no master, set mute button
-		if (channel_strip._track!=self.song().master_track):
-			channel_strip.set_mute_button(self._button_stop)
-
-		# setting solo button
-		channel_strip.set_solo_button(self._button_play)
-
-		# if track can be armed, set arm button
-		if (channel_strip._track.can_be_armed):
-			channel_strip.set_arm_button(self._button_record)
-
-	#
 	# Clip triggers
 	#
 
 	def clip_fired(self, clip_num, value):
-		self.log_message('clip_fired(clip_num=%s, value=%s)' % (clip_num, value))
 		if value == NOTE_ON:
+
+			self.log_message('clip_fired(clip_num=%s, value=%s)' % (clip_num, value))
 			clip_slot = self.selected_track.clip_slots[clip_num]
 
-			if clip_slot.is_playing:
-				self.log_message('stoping clip')
-				clip_slot.stop()
-			else:
-				self.log_message('firing clip. has_clip=%s has_stop=%s, playing_status=%s' % (
-					clip_slot.has_clip,
-					clip_slot.has_stop_button,
-					clip_slot.playing_status,
-				))
-				clip_slot.fire()
+			# if clip_slot.is_playing:
+			# 	self.log_message('stoping clip')
+			# 	clip_slot.stop()
+			# else:
+			# 	self.log_message('firing clip. has_clip=%s has_stop=%s, playing_status=%s' % (
+			# 		clip_slot.has_clip,
+			# 		clip_slot.has_stop_button,
+			# 		clip_slot.playing_status,
+			# 	))
+			# 	clip_slot.fire()
+
+			self.log_message('firing clip. has_clip=%s has_stop=%s, playing_status=%s' % (
+				clip_slot.has_clip,
+				clip_slot.has_stop_button,
+				clip_slot.playing_status,
+			))
+			clip_slot.fire()
+
+
 
 			# Update scene selection to fired clip's row.
 			self.set_selected_scene(clip_num)
@@ -413,17 +473,20 @@ class OP1(ControlSurface):
 
 		self.log_message("refresh_state()")
 		self.retries_count = 0
+		self.next_retry_ts = None
+		self.next_retry_delay = 1
 		self.device_connected = False
 
 	def update_display(self):
 		super(OP1, self).update_display()
 
-		if not(self.device_connected) and self.retries_count < CONNECTION_MAX_RETRIES:
-			self.attempt_connection_with_device()
+		if not(self.device_connected):
+			if self.next_retry_ts is None or time.time() >= self.next_retry_ts:
+				self.attempt_connection_with_device()
 			return
 
 		# Render the currently active view
-		self.view.render()
+		self.current_mode.view.render()
 
 	#
 	# Connection Management
@@ -433,13 +496,14 @@ class OP1(ControlSurface):
 		super(OP1, self).build_midi_map(midi_map_handle)
 
 		# map mixer controls to currently selected track
-		self.map_mixer_controls_for_current_track()
+		# self.map_mixer_controls_for_current_track()
 
 	def attempt_connection_with_device(self):
 		self.log_message("Attempting to connect to OP-1... (num_retries: %s)" % self.retries_count)
 		self.retries_count += 1
+		self.next_retry_ts = time.time() + self.next_retry_delay
+		self.next_retry_delay *= 2
 		self._send_midi(ID_SEQUENCE)
-		time.sleep(1)
 
 	def handle_device_connection_success(self):
 		self.device_connected = True
